@@ -11,41 +11,32 @@ contract LendingFactory {
     struct LendingInfo {
         uint amount;
         uint lockPeriod;
+        uint lockEndTime;
         uint marketRate;
-        uint lendingStart;
         uint baseRate;
+        uint lendingStart;
         address lendingToken;
         address liquidityPool;
     }
 
     mapping(address => LendingInfo) lendingUser;
+    mapping(address => mapping(uint => bool)) isDepositUser;
+    mapping(address => bool) isValidLiquidity;
     mapping(address => address) tokenLiquidity;
     mapping(address => mapping(address => mapping(uint => LendingInfo)))
         public userLendingInfo;
     mapping(address => uint) lendingLiquidityAmount;
     mapping(address => uint[]) userDepositsId;
 
-    event CreateLiquidity(
-        address liquidityContract,
-        address _token,
-        uint _baseRate
+    event PoolCreated(
+        address indexed pool,
+        address indexed token,
+        uint baseRate
     );
     event Withdraw(address user, address token, uint amount);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "called must be owner");
-        _;
-    }
-    modifier onlyLiquidityPools() {
-        bool isValid = false;
-
-        for (uint i = 0; i < liquidityPools.length; i++) {
-            if (liquidityPools[i] == msg.sender) {
-                isValid = true;
-                break;
-            }
-        }
-        require(isValid, "just liquidityPools are called");
         _;
     }
 
@@ -58,21 +49,31 @@ contract LendingFactory {
         address _token,
         uint _amount,
         uint _luckPeriod,
+        uint _lockEndTime,
         uint _marketRate,
         uint _baseRate
-    ) external onlyLiquidityPools {
-        uint depositId = block.number + block.timestamp;
+    ) external {
+        require(
+            tokenLiquidity[_token] == msg.sender,
+            "only liquidity pool contract call"
+        );
+        require(isValidLiquidity[msg.sender], "Not a valid liquidity pool");
+        uint depositId = uint(
+            keccak256(abi.encodePacked(_user, _amount, block.timestamp))
+        );
         userLendingInfo[_user][msg.sender][depositId] = LendingInfo(
             _amount,
             _luckPeriod,
+            _lockEndTime,
             _marketRate,
-            block.timestamp,
             _baseRate,
+            block.timestamp,
             _token,
             msg.sender
         );
+        isDepositUser[_user][depositId] = true;
         lendingLiquidityAmount[msg.sender] += _amount;
-        userDepositsId[msg.sender].push(depositId);
+        userDepositsId[_user].push(depositId);
     }
 
     function createLiquidityPool(
@@ -81,6 +82,7 @@ contract LendingFactory {
         uint _multiplier,
         uint _timeMultiplier,
         uint _maxLockTime,
+        uint _minLockTime,
         address _priceOracle,
         uint _oracleDecimal
     ) public onlyOwner {
@@ -93,36 +95,37 @@ contract LendingFactory {
                 _multiplier,
                 _timeMultiplier,
                 _maxLockTime,
+                _minLockTime,
                 _oracleDecimal,
                 _token,
                 _priceOracle
             )
         );
         liquidityPools.push(contractAddress);
-
+        isValidLiquidity[contractAddress] = true;
         tokenLiquidity[_token] = contractAddress;
-        emit CreateLiquidity(contractAddress, _token, _baseRate);
+        emit PoolCreated(contractAddress, _token, _baseRate);
     }
 
     function withdraw(uint _depositId, address _liquidity) public {
-        require(isValidLiquidity(_liquidity), "liquidity is not valid");
-        require(isValidDepositId(msg.sender, _depositId), "is not valid id");
+        require(isValidLiquidity[_liquidity], "liquidity is not valid");
+        require(isDepositUser[msg.sender][_depositId], "is not valid id");
         LendingInfo memory depositInfo = userLendingInfo[msg.sender][
             _liquidity
         ][_depositId];
         require(
-            depositInfo.lockPeriod < block.timestamp,
+            depositInfo.lockEndTime <= block.timestamp,
             "not allowed to withdraw"
         );
 
         ///send request to liquidity contract for transfer tokens
         ILiquidityPool(_liquidity).unlockTokens(
             msg.sender,
-            depositInfo.lendingToken,
             calculateRate(
                 depositInfo.amount,
                 depositInfo.marketRate,
-                depositInfo.baseRate
+                depositInfo.baseRate,
+                depositInfo.lockPeriod
             ) //calculate amount + rate
         );
         emit Withdraw(msg.sender, depositInfo.lendingToken, depositInfo.amount);
@@ -131,29 +134,12 @@ contract LendingFactory {
     function calculateRate(
         uint _amount,
         uint _marketRate,
-        uint _baseRate
+        uint _baseRate,
+        uint _lockPeriod
     ) public pure returns (uint) {
         uint rate = (_marketRate > _baseRate) ? _marketRate : _baseRate;
-        return _amount + ((rate * _amount) / 100);
-    }
-
-    function isValidLiquidity(
-        address _liquidity
-    ) public view returns (bool res) {
-        for (uint i = 0; i < liquidityPools.length; i++) {
-            if (_liquidity == liquidityPools[i]) {
-                return true;
-            }
-        }
-    }
-
-    function isValidDepositId(
-        address _user,
-        uint _id
-    ) public view returns (bool res) {
-        uint[] memory ids = userDepositsId[_user];
-        for (uint i = 0; i < ids.length; i++) {
-            if (ids[i] == _id) return true;
-        }
+        uint timeInYears = _lockPeriod / 365 days;
+        uint compoundInterest = _amount * ((1 + rate / 100) ** timeInYears);
+        return compoundInterest;
     }
 }

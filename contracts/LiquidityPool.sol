@@ -8,12 +8,13 @@ import "./IAggregatorV3Interface.sol";
 
 contract LiquidityPool {
     uint totalBorrow;
-    RateData public rateData;
+    uint public decimal;
     uint256 public maxLockTime;
+    uint256 public minLockTime;
     address public lendingContract;
     address public token;
     address public priceOracle;
-    uint public decimal;
+    RateData public rateData;
 
     struct RateData {
         uint256 baseRate;
@@ -36,16 +37,20 @@ contract LiquidityPool {
         uint _multiplier,
         uint _timeMultiplier,
         uint _maxLockTime,
+        uint _minLockTime,
         uint _decimal,
         address _token,
         address _priceOracle
     ) {
-        require(_maxLockTime <= 365, "Max lock time too high");
+        require(_maxLockTime != 0, "Max lock time too high");
+        require(_maxLockTime != 0, "Max lock time too high");
+        require(_minLockTime < _maxLockTime, "invalid input");
         lendingContract = msg.sender;
         rateData.baseRate = _baseRate;
         rateData.multiplier = _multiplier;
         rateData.timeMultiplier = _timeMultiplier;
         maxLockTime = _maxLockTime * 1 days;
+        minLockTime = _minLockTime * 1 days;
         token = _token;
         priceOracle = _priceOracle;
         decimal = _decimal;
@@ -60,9 +65,9 @@ contract LiquidityPool {
 
     function deposit(uint _amount, uint _periodTime) public {
         require(
-            _periodTime >= (block.timestamp + 60 days) &&
-                _periodTime <= maxLockTime,
-            "at least 60 days for deposit"
+            _periodTime >= (minLockTime * 1 days) &&
+                _periodTime <= (maxLockTime * 1 days),
+            "invalid input"
         );
         require(_amount != 0, "not valid amount");
         require(
@@ -71,10 +76,11 @@ contract LiquidityPool {
         );
         uint lockEndTime = block.timestamp + _periodTime;
         userBalance[msg.sender] += _amount;
-        ILendingFactory(lendingContract).regiterDepoit(
+        ILendingFactory(lendingContract).registerDeposit(
             msg.sender,
             token,
             _amount,
+            _periodTime,
             lockEndTime,
             getMarketRate(_periodTime, token),
             rateData.baseRate
@@ -98,12 +104,11 @@ contract LiquidityPool {
 
     function unlockTokens(
         address _user,
-        address _token,
         uint _amount
     ) external payable onlyLendingContract {
         require(userBalance[_user] >= _amount, "Insufficient liquidity");
         userBalance[_user] -= _amount;
-        require(IERC20(_token).transfer(_user, _amount), "failed to transfer");
+        require(IERC20(token).transfer(_user, _amount), "failed to transfer");
         emit UnlockToken(token, _user, _amount);
     }
 
@@ -137,7 +142,28 @@ contract LiquidityPool {
         return liquidityInUSD; // برگرداندن مقدار لیکوییدیتی به دلار
     }
 
-    function getTotalBorrows() public pure returns (uint) {
-        return 10;
+    function getTotalBorrows() public view returns (uint) {
+        return totalBorrow;
+    }
+
+    function scaleOraclePrice(
+        uint256 oraclePrice, // قیمت اوراکل
+        uint256 oracleDecimals, // دسیمال‌های اوراکل
+        uint256 tokenDecimals // دسیمال‌های توکن
+    ) public pure returns (uint256) {
+        if (oracleDecimals > tokenDecimals) {
+            // اگر دسیمال اوراکل بیشتر از دسیمال توکن باشد
+            uint256 scaleFactor = oracleDecimals - tokenDecimals;
+            // مقیاس‌دهی اوراکل به سمت پایین
+            return oraclePrice / (10 ** scaleFactor);
+        } else if (oracleDecimals < tokenDecimals) {
+            // اگر دسیمال اوراکل کمتر از دسیمال توکن باشد
+            uint256 scaleFactor = tokenDecimals - oracleDecimals;
+            // مقیاس‌دهی اوراکل به سمت بالا
+            return oraclePrice * (10 ** scaleFactor);
+        } else {
+            // اگر دسیمال‌ها برابر باشند، بدون تغییر باز می‌گردد
+            return oraclePrice;
+        }
     }
 }
