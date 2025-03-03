@@ -8,6 +8,8 @@ contract LendingFactory {
     address liquidityContract;
     address owner;
     address[] liquidityPools;
+    address coinPriceOracle;
+    uint coinDecimal;
     struct LendingInfo {
         uint amount;
         uint lockPeriod;
@@ -48,7 +50,7 @@ contract LendingFactory {
         address _user,
         address _token,
         uint _amount,
-        uint _luckPeriod,
+        uint _lockPeriod,
         uint _lockEndTime,
         uint _marketRate,
         uint _baseRate
@@ -63,7 +65,7 @@ contract LendingFactory {
         );
         userLendingInfo[_user][msg.sender][depositId] = LendingInfo(
             _amount,
-            _luckPeriod,
+            _lockPeriod,
             _lockEndTime,
             _marketRate,
             _baseRate,
@@ -113,6 +115,7 @@ contract LendingFactory {
         LendingInfo memory depositInfo = userLendingInfo[msg.sender][
             _liquidity
         ][_depositId];
+        require(depositInfo.amount > 0, "No deposit found for this ID");
         require(
             depositInfo.lockEndTime <= block.timestamp,
             "not allowed to withdraw"
@@ -139,7 +142,25 @@ contract LendingFactory {
     ) public pure returns (uint) {
         uint rate = (_marketRate > _baseRate) ? _marketRate : _baseRate;
         uint timeInYears = _lockPeriod / 365 days;
-        uint compoundInterest = _amount * ((1 + rate / 100) ** timeInYears);
+        uint compoundInterest = _amount;
+
+        for (uint i = 0; i < timeInYears; i++) {
+            compoundInterest += (compoundInterest * rate) / 100;
+        }
         return compoundInterest;
+    }
+
+    function getCoinOracleInfo()
+        external
+        view
+        returns (address coinOracle, uint decimal)
+    {
+        return (coinOracle, coinDecimal);
+    }
+
+    function getUserDeposits(
+        address _user
+    ) external view returns (uint[] memory) {
+        return userDepositsId[_user];
     }
 }

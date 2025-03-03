@@ -7,20 +7,38 @@ import "./IERC20.sol";
 import "./IAggregatorV3Interface.sol";
 
 contract LiquidityPool {
-    uint totalBorrow;
-    uint public decimal;
+    uint totalBorrowInUSD;
+    uint totalBorrowTokens;
+    uint256 public decimalUnit;
+    uint validBorrowPercent;
     uint256 public maxLockTime;
     uint256 public minLockTime;
     address public lendingContract;
     address public token;
     address public priceOracle;
+    address public coinPriceOracle;
     RateData public rateData;
+    uint fee;
 
     struct RateData {
         uint256 baseRate;
         uint256 multiplier; // 20 ضریب تأثیر لگاریتمی
         uint256 timeMultiplier; //5
     }
+    struct BorrowInfo {
+        address user;
+        uint collateralInUSD;
+        uint coinAmount;
+        uint startBorrowTime;
+        uint borrowAmountInUSD;
+        uint borrowAmountToken;
+        uint marketRate;
+        uint borrowRate;
+        uint lockTime;
+        uint fee;
+        bool isRepay;
+    }
+    mapping(address => mapping(uint => BorrowInfo)) userBrrows;
 
     mapping(address => uint) userBalance;
 
@@ -38,7 +56,7 @@ contract LiquidityPool {
         uint _timeMultiplier,
         uint _maxLockTime,
         uint _minLockTime,
-        uint _decimal,
+        uint _decimalUnit,
         address _token,
         address _priceOracle
     ) {
@@ -53,14 +71,14 @@ contract LiquidityPool {
         minLockTime = _minLockTime * 1 days;
         token = _token;
         priceOracle = _priceOracle;
-        decimal = _decimal;
+        decimalUnit = _decimalUnit;
     }
 
     function getTokenPriceInUSD() public view returns (uint) {
         // فرض کنید تابع getLatestPrice() قیمت توکن را از اوراکل می‌گیرد
         (, int price, , , ) = IAggregatorV3Interface(priceOracle)
             .latestRoundData();
-        return uint(price);
+        return _scaleDecimal(uint(price), IERC20(token).decimals());
     }
 
     function deposit(uint _amount, uint _periodTime) public {
@@ -82,10 +100,126 @@ contract LiquidityPool {
             _amount,
             _periodTime,
             lockEndTime,
-            getMarketRate(_periodTime, token),
+            getMarketRate(_periodTime),
             rateData.baseRate
         );
         emit Deposit(token, msg.sender, _amount, _periodTime);
+    }
+
+    function unlockTokens(
+        address _user,
+        uint _amount
+    ) external payable onlyLendingContract {
+        require(userBalance[_user] >= _amount, "Insufficient liquidity");
+        userBalance[_user] -= _amount;
+        require(IERC20(token).transfer(_user, _amount), "failed to transfer");
+        emit UnlockToken(token, _user, _amount);
+    }
+
+    function getMarketRate(uint256 lockTime) public view returns (uint256) {
+        uint256 totalLiquidityInUSD = getTotalLiquidity(token);
+        uint256 totalBorrows = getTotalBorrowInUSD();
+
+        if (totalLiquidityInUSD == 0) return rateData.baseRate;
+
+        uint256 utilization = (totalBorrows * 100) / totalLiquidityInUSD;
+
+        // محاسبه لگاریتمی نرخ بهره
+        uint256 logU = (utilization * 100) / (utilization + 10);
+        uint256 baseRateCalc = rateData.baseRate +
+            (logU * rateData.multiplier) /
+            100;
+
+        // محاسبه اثر مدت زمان قفل
+        uint256 lockBonus = (lockTime * rateData.timeMultiplier) / maxLockTime;
+
+        return baseRateCalc + lockBonus;
+    }
+
+    function getBorrowRate(uint _lockTime) public view returns (uint) {
+        uint marketRate = getMarketRate(_lockTime);
+        return marketRate + fee;
+    }
+
+    function getTotalLiquidity(address _token) public view returns (uint) {
+        uint256 tokenAmount = IERC20(_token).balanceOf(address(this));
+        uint tokenPrice = getTokenPriceInUSD(); // دریافت قیمت توکن از اوراکل
+        uint256 liquidityInUSD = (tokenAmount * tokenPrice) /
+            (10 ** decimalUnit);
+        return liquidityInUSD; // برگرداندن مقدار لیکوییدیتی به دلار
+    }
+
+    function getTotalBorrowInUSD() public view returns (uint) {
+        return totalBorrowInUSD;
+    }
+
+    function borrow(uint _time) public payable {
+        require(_time != 0, "invalid lock time");
+        require(_time <= 60 days, "invalid lock time");
+        (uint amountInUSD, ) = _calcCoinOracle(msg.value);
+        uint validBorrowPercentUSD = (amountInUSD * validBorrowPercent) / 100;
+        uint tokenPrice = getTokenPriceInUSD();
+        uint borrowRate = getBrrowRate(_time);
+        uint marketRate = getMarketRate(_time);
+        uint lockTime = (_time * 1 days) + block.timestamp;
+        uint amountBorrowTokens = validBorrowPercentUSD / tokenPrice;
+        uint borrowId = uint(
+            keccak256(abi.encodePacked(msg.sender, msg.value, block.timestamp))
+        );
+
+        userBrrows[msg.sender][borrowId] = BorrowInfo(
+            msg.sender,
+            amountInUSD,
+            msg.value,
+            block.timestamp,
+            validBorrowPercentUSD,
+            amountBorrowTokens,
+            marketRate,
+            borrowRate,
+            lockTime,
+            fee,
+            false
+        );
+        require(
+            IERC20(token).transfer(msg.sender, amountBorrowTokens),
+            "transfer was failed"
+        );
+    }
+
+    function getBrrowRate(uint _time) public view returns (uint) {
+        uint marketRate = getMarketRate(_time);
+        return marketRate + fee;
+    }
+
+    function _calcCoinOracle(
+        uint _amount
+    ) private view returns (uint _priceInUSD, uint _coinPrice) {
+        (address coinOracle, uint decimalCoin) = ILendingFactory(
+            lendingContract
+        ).getCoinOracleInfo();
+        (, int price, , , ) = IAggregatorV3Interface(coinOracle)
+            .latestRoundData();
+        uint coinPrice = _scaleDecimal(uint(price), decimalCoin);
+        uint priceInUSD = _amount * coinPrice;
+        return (priceInUSD, coinPrice);
+    }
+
+    function _scaleDecimal(
+        uint256 amount, // مقدار اصلی
+        uint256 decimals // دسیمال اولیه
+    ) private view returns (uint256) {
+        if (decimals > decimalUnit) {
+            // اگر دسیمال مقصد کوچکتر باشه، باید تقسیم کنیم
+            uint256 scaleFactor = decimals - decimalUnit;
+            return amount / (10 ** scaleFactor);
+        } else if (decimals < decimalUnit) {
+            // اگر دسیمال مقصد بزرگتر باشه، باید ضرب کنیم
+            uint256 scaleFactor = decimalUnit - decimals;
+            return amount * (10 ** scaleFactor);
+        } else {
+            // اگر دسیمال‌ها برابر باشن، همان مقدار رو برمی‌گردونه
+            return amount;
+        }
     }
 
     function setMultiplier(
@@ -100,70 +234,5 @@ contract LiquidityPool {
     function setBaseRate(uint _rate) public onlyLendingContract {
         require(_rate != 0, "base rate cannot be zero");
         rateData.baseRate = _rate;
-    }
-
-    function unlockTokens(
-        address _user,
-        uint _amount
-    ) external payable onlyLendingContract {
-        require(userBalance[_user] >= _amount, "Insufficient liquidity");
-        userBalance[_user] -= _amount;
-        require(IERC20(token).transfer(_user, _amount), "failed to transfer");
-        emit UnlockToken(token, _user, _amount);
-    }
-
-    function getMarketRate(
-        uint256 lockTime,
-        address _token
-    ) public view returns (uint256) {
-        uint256 totalLiquidity = getTotalLiquidity(_token);
-        uint256 totalBorrows = getTotalBorrows();
-
-        if (totalLiquidity == 0) return rateData.baseRate;
-
-        uint256 utilization = (totalBorrows * 100) / totalLiquidity;
-
-        // محاسبه لگاریتمی نرخ بهره
-        uint256 logU = (utilization * 100) / (utilization + 10);
-        uint256 baseRateCalc = rateData.baseRate +
-            (logU * rateData.multiplier) /
-            100;
-
-        // محاسبه اثر مدت زمان قفل
-        uint256 lockBonus = (lockTime * rateData.timeMultiplier) / maxLockTime;
-
-        return baseRateCalc + lockBonus;
-    }
-
-    function getTotalLiquidity(address _token) public view returns (uint) {
-        uint256 tokenAmount = IERC20(_token).balanceOf(address(this));
-        uint tokenPrice = getTokenPriceInUSD(); // دریافت قیمت توکن از اوراکل
-        uint256 liquidityInUSD = (tokenAmount * tokenPrice) / (10 ** decimal);
-        return liquidityInUSD; // برگرداندن مقدار لیکوییدیتی به دلار
-    }
-
-    function getTotalBorrows() public view returns (uint) {
-        return totalBorrow;
-    }
-
-    function scaleOraclePrice(
-        uint256 oraclePrice, // قیمت اوراکل
-        uint256 oracleDecimals, // دسیمال‌های اوراکل
-        uint256 tokenDecimals // دسیمال‌های توکن
-    ) public pure returns (uint256) {
-        if (oracleDecimals > tokenDecimals) {
-            // اگر دسیمال اوراکل بیشتر از دسیمال توکن باشد
-            uint256 scaleFactor = oracleDecimals - tokenDecimals;
-            // مقیاس‌دهی اوراکل به سمت پایین
-            return oraclePrice / (10 ** scaleFactor);
-        } else if (oracleDecimals < tokenDecimals) {
-            // اگر دسیمال اوراکل کمتر از دسیمال توکن باشد
-            uint256 scaleFactor = tokenDecimals - oracleDecimals;
-            // مقیاس‌دهی اوراکل به سمت بالا
-            return oraclePrice * (10 ** scaleFactor);
-        } else {
-            // اگر دسیمال‌ها برابر باشند، بدون تغییر باز می‌گردد
-            return oraclePrice;
-        }
     }
 }

@@ -13,4 +13,9 @@ interface ILendingFactory {
         uint _marketRate,
         uint _basrRate
     ) external;
+
+    function getCoinOracleInfo()
+        external
+        view
+        returns (address coinOracle, uint decimal);
 }
