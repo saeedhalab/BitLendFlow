@@ -61,7 +61,6 @@ contract LiquidityPool {
         address _priceOracle
     ) {
         require(_maxLockTime != 0, "Max lock time too high");
-        require(_maxLockTime != 0, "Max lock time too high");
         require(_minLockTime < _maxLockTime, "invalid input");
         lendingContract = msg.sender;
         rateData.baseRate = _baseRate;
@@ -83,8 +82,7 @@ contract LiquidityPool {
 
     function deposit(uint _amount, uint _periodTime) public {
         require(
-            _periodTime >= (minLockTime * 1 days) &&
-                _periodTime <= (maxLockTime * 1 days),
+            _periodTime >= minLockTime && _periodTime <= maxLockTime,
             "invalid input"
         );
         require(_amount != 0, "not valid amount");
@@ -125,7 +123,10 @@ contract LiquidityPool {
         uint256 utilization = (totalBorrows * 100) / totalLiquidityInUSD;
 
         // محاسبه لگاریتمی نرخ بهره
-        uint256 logU = (utilization * 100) / (utilization + 10);
+        uint256 precision = 1e18; // مقیاس‌دهی برای جلوگیری از گرد شدن
+
+        uint256 logU = ((utilization * precision * 100) / (utilization + 10)) /
+            precision;
         uint256 baseRateCalc = rateData.baseRate +
             (logU * rateData.multiplier) /
             100;
@@ -159,10 +160,14 @@ contract LiquidityPool {
         (uint amountInUSD, ) = _calcCoinOracle(msg.value);
         uint validBorrowPercentUSD = (amountInUSD * validBorrowPercent) / 100;
         uint tokenPrice = getTokenPriceInUSD();
-        uint borrowRate = getBrrowRate(_time);
+        uint borrowRate = getBorrowRate(_time);
         uint marketRate = getMarketRate(_time);
         uint lockTime = (_time * 1 days) + block.timestamp;
         uint amountBorrowTokens = validBorrowPercentUSD / tokenPrice;
+        require(
+            amountBorrowTokens <= IERC20(token).balanceOf(address(this)),
+            "Insufficient liquidity"
+        );
         uint borrowId = uint(
             keccak256(abi.encodePacked(msg.sender, msg.value, block.timestamp))
         );
